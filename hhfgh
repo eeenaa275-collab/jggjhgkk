@@ -1,0 +1,976 @@
+# ============================================================
+#                    VIBE VPN BOT
+# ============================================================
+import telebot
+from telebot import types
+import sqlite3
+import datetime
+import threading
+import time
+import os
+
+# ============================================================
+#                    CONFIG
+# ============================================================
+BOT_TOKEN = "8811089341:AAFRnmv72LP7a8SikAego3SfMKvnuXOLIMQ"
+ADMIN_ID = 6765459931
+SUPPORT = "@danya_3322"
+DEV = "@danya_3322"
+SUPPORT_USERNAME = "danya_3322"
+DB_NAME = "vibe_vpn.db"
+
+TRIAL_URL = "https://auth.quattro-cloud.ru/CvhvhNJp1qk0AvpX"
+SITE_URL = "https://auth.quattro-cloud.ru/CvhvhNJp1qk0AvpX"
+
+IMAGE_DIR = "image"
+
+PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti-09-15-75"
+TERMS_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-09-15-31"
+
+MASTER_SUB_URL = "https://auth.quattro-cloud.ru/CvhvhNJp1qk0AvpX"
+
+CARD_NUMBER = "2204321045422904"
+PAYMENT_TIMEOUT_MIN = 15
+MIN_TOPUP = 50
+MAX_TOPUP = 10000
+
+TARIFFS = [
+    {"name": "1 месяц",    "days": 30,  "price": 150},
+    {"name": "3 месяца",   "days": 90,  "price": 450},
+    {"name": "6 месяцев",  "days": 180, "price": 650},
+    {"name": "12 месяцев", "days": 365, "price": 1300},
+]
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+user_states = {}
+
+
+# ============================================================
+#                    ПАТЧ ОТ ОШИБКИ "message is not modified"
+# ============================================================
+import telebot.apihelper
+
+_original_make_request = telebot.apihelper._make_request
+
+def _patched_make_request(token, method_url, params=None, files=None, method='get'):
+    try:
+        return _original_make_request(token, method_url, params=params, files=files, method=method)
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" in str(e):
+            return {"ok": True, "result": True}
+        raise
+
+telebot.apihelper._make_request = _patched_make_request
+
+
+# ============================================================
+#                    ПОИСК КАРТИНКИ
+# ============================================================
+def get_start_photo():
+    if not os.path.exists(IMAGE_DIR):
+        return None
+    supported = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
+    for f in os.listdir(IMAGE_DIR):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in supported:
+            return os.path.join(IMAGE_DIR, f)
+    return None
+
+
+# ============================================================
+#                    DATABASE
+# ============================================================
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        tg_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        registered_at TEXT,
+        balance INTEGER DEFAULT 0,
+        sub_status TEXT DEFAULT 'Неактивна',
+        sub_until TEXT,
+        trial_used INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER,
+        amount INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        confirmed_at TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER,
+        tariff_name TEXT,
+        days INTEGER,
+        price INTEGER,
+        vpn_key TEXT,
+        activated_at TEXT,
+        expires_at TEXT,
+        status TEXT DEFAULT 'Активна'
+    )''')
+    cursor = c.execute("PRAGMA table_info(subscriptions)")
+    cols = [row[1] for row in cursor.fetchall()]
+    if 'vpn_key' not in cols:
+        c.execute("ALTER TABLE subscriptions ADD COLUMN vpn_key TEXT")
+    conn.commit()
+    conn.close()
+
+
+def add_user(tg_id, username, first_name):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    c.execute('''INSERT OR IGNORE INTO users 
+                 (tg_id, username, first_name, registered_at)
+                 VALUES (?, ?, ?, ?)''', (tg_id, username or "", first_name or "", now))
+    conn.commit()
+    conn.close()
+
+
+def get_user(tg_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def set_trial_used(tg_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    expire = (datetime.datetime.now() + datetime.timedelta(days=5)).isoformat()
+    c.execute("UPDATE users SET trial_used = 1, sub_status = 'Активна (пробная)', sub_until = ? WHERE tg_id = ?",
+              (expire, tg_id))
+    conn.commit()
+    conn.close()
+
+
+def add_balance(tg_id, amount):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id))
+    conn.commit()
+    conn.close()
+
+
+def deduct_balance(tg_id, amount):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
+    row = c.fetchone()
+    if not row or row[0] < amount:
+        conn.close()
+        return False
+    c.execute("UPDATE users SET balance = balance - ? WHERE tg_id = ?", (amount, tg_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def activate_subscription(tg_id, days):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT sub_until FROM users WHERE tg_id = ?", (tg_id,))
+    row = c.fetchone()
+    base = datetime.datetime.now()
+    if row and row[0]:
+        try:
+            old = datetime.datetime.fromisoformat(row[0])
+            if old > base:
+                base = old
+        except:
+            pass
+    expire = (base + datetime.timedelta(days=days)).isoformat()
+    c.execute("UPDATE users SET sub_status = 'Активна', sub_until = ? WHERE tg_id = ?",
+              (expire, tg_id))
+    conn.commit()
+    conn.close()
+    return expire
+
+
+def add_subscription_record(tg_id, tariff_name, days, price, vpn_key, expires_at):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''INSERT INTO subscriptions 
+                 (tg_id, tariff_name, days, price, vpn_key, activated_at, expires_at, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'Активна')''',
+              (tg_id, tariff_name, days, price, vpn_key,
+               datetime.datetime.now().isoformat(), expires_at))
+    conn.commit()
+    conn.close()
+
+
+def get_user_subscriptions(tg_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT id, tariff_name, days, price, vpn_key, activated_at, expires_at, status
+                 FROM subscriptions WHERE tg_id = ?
+                 ORDER BY id DESC''', (tg_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def update_expired_subscriptions():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    c.execute('''UPDATE subscriptions SET status = 'Истекла'
+                 WHERE expires_at < ? AND status = 'Активна' ''', (now,))
+    conn.commit()
+    conn.close()
+
+
+def create_payment(tg_id, amount):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    c.execute('''INSERT INTO payments (tg_id, amount, status, created_at)
+                 VALUES (?, ?, 'pending', ?)''', (tg_id, amount, now))
+    pid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return pid
+
+
+def get_payment(pid):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT id, tg_id, amount, status, created_at FROM payments WHERE id = ?", (pid,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def set_payment_status(pid, status):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE payments SET status = ?, confirmed_at = ? WHERE id = ?",
+              (status, datetime.datetime.now().isoformat(), pid))
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+#                    KEYBOARDS
+# ============================================================
+def main_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("⚡ Купить подписку", callback_data="buy"))
+    kb.add(types.InlineKeyboardButton("📦 Мои подписки", callback_data="my_subs"))
+    kb.add(
+        types.InlineKeyboardButton("🎁 Бонусы", callback_data="bonus"),
+        types.InlineKeyboardButton("ℹ️ Информация", callback_data="info"),
+    )
+    kb.add(types.InlineKeyboardButton("🎁 Пробная подписка", callback_data="trial"))
+    kb.add(types.InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup"))
+    kb.add(types.InlineKeyboardButton("📊 Статус серверов", callback_data="servers"))
+    kb.add(types.InlineKeyboardButton("📄 Политика конф.", url=PRIVACY_URL))
+    kb.add(types.InlineKeyboardButton("📜 Польз. соглашение", url=TERMS_URL))
+    kb.add(types.InlineKeyboardButton("📞 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"))
+    return kb
+
+
+def back_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    return kb
+
+
+def buy_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for t in TARIFFS:
+        kb.add(types.InlineKeyboardButton(
+            f"💠 {t['name']} — {t['price']}₽",
+            callback_data=f"tariff_{t['days']}"
+        ))
+    kb.add(types.InlineKeyboardButton("💳 Пополнить баланс", callback_data="topup"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    return kb
+
+
+def trial_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("✅ Активировать", callback_data="activate_trial"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_main"))
+    return kb
+
+
+def bonus_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🎟 Ввести промокод", callback_data="promo"))
+    kb.add(types.InlineKeyboardButton("👥 Пригласить друга", callback_data="invite"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    return kb
+
+
+def payment_kb(pid):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid_{pid}"))
+    kb.add(types.InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{pid}"))
+    return kb
+
+
+# ============================================================
+#                    SCREENS
+# ============================================================
+def main_menu_text(user):
+    balance = user[4] if user else 0
+    status = user[5] if user else "Неактивна"
+    return (
+        "🚀 <b>VIBE VPN</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Добро пожаловать\n"
+        "в интернет <b>без ограничений</b>\n\n"
+        "▫️ <b>Главное меню</b>\n\n"
+        f"📋 Подписка: <b>{status}</b>\n"
+        f"💰 Баланс: <b>{balance}₽</b>\n\n"
+        "Активируйте подписку и\n"
+        "продолжайте пользоваться\n"
+        "свободным интернетом!\n\n"
+        "👇 <b>Выберите раздел в меню ниже</b>\n\n"
+        f"👨‍💻 Разработчик: {DEV}"
+    )
+
+
+# ============================================================
+#                    START
+# ============================================================
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    update_expired_subscriptions()
+    user = get_user(message.from_user.id)
+    user_states.pop(message.from_user.id, None)
+
+    caption = main_menu_text(user)
+    photo_path = get_start_photo()
+
+    if photo_path and os.path.exists(photo_path):
+        try:
+            with open(photo_path, "rb") as photo:
+                bot.send_photo(message.chat.id, photo, caption=caption,
+                               reply_markup=main_kb(), parse_mode="HTML")
+            return
+        except Exception as e:
+            print(f"Photo error: {e}")
+
+    bot.send_message(message.chat.id, caption, reply_markup=main_kb(), parse_mode="HTML")
+
+
+# ============================================================
+#                    CALLBACKS
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "back_main")
+def cb_back_main(call):
+    update_expired_subscriptions()
+    user = get_user(call.from_user.id)
+    user_states.pop(call.from_user.id, None)
+    try:
+        bot.edit_message_text(
+            main_menu_text(user),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=main_kb(),
+            parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "buy")
+def cb_buy(call):
+    user = get_user(call.from_user.id)
+    balance = user[4] if user else 0
+    text = (
+        "⚡ <b>Купить подписку</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Ваш баланс: <b>{balance}₽</b>\n\n"
+        "Выберите тариф 👇\n"
+        "<i>Сумма спишется с баланса.</i>"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=buy_kb(), parse_mode="HTML")
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("tariff_"))
+def cb_tariff(call):
+    days = int(call.data.replace("tariff_", ""))
+    t = next((x for x in TARIFFS if x["days"] == days), None)
+    if not t:
+        return bot.answer_callback_query(call.id, "Тариф не найден")
+
+    user = get_user(call.from_user.id)
+    balance = user[4] if user else 0
+
+    if balance < t["price"]:
+        missing = t["price"] - balance
+        try:
+            bot.edit_message_text(
+                f"❌ <b>Недостаточно средств</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💠 Тариф: <b>{t['name']}</b>\n"
+                f"💰 Цена: <b>{t['price']}₽</b>\n"
+                f"💳 Ваш баланс: <b>{balance}₽</b>\n\n"
+                f"❗ Не хватает: <b>{missing}₽</b>\n\n"
+                "Пополните баланс и попробуйте снова.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=buy_kb(),
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        return bot.answer_callback_query(call.id, f"Не хватает {missing}₽", show_alert=True)
+
+    if not deduct_balance(call.from_user.id, t["price"]):
+        return bot.answer_callback_query(call.id, "❌ Ошибка списания", show_alert=True)
+
+    expire_iso = activate_subscription(call.from_user.id, t["days"])
+    expire_str = datetime.datetime.fromisoformat(expire_iso).strftime("%d.%m.%Y")
+
+    add_subscription_record(call.from_user.id, t["name"], t["days"], t["price"],
+                            MASTER_SUB_URL, expire_iso)
+
+    new_user = get_user(call.from_user.id)
+    new_balance = new_user[4] if new_user else 0
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🌐 Открыть сайт", url=SITE_URL))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+
+    try:
+        bot.edit_message_text(
+            f"✅ <b>Подписка активирована!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💠 Тариф: <b>{t['name']}</b>\n"
+            f"📅 Дней: <b>{t['days']}</b>\n"
+            f"📆 Активна до: <b>{expire_str}</b>\n\n"
+            f"💸 Списано: <b>{t['price']}₽</b>\n"
+            f"💰 Остаток баланса: <b>{new_balance}₽</b>\n\n"
+            "🔑 <b>Твой ключ VPN:</b>\n"
+            f"<code>{MASTER_SUB_URL}</code>\n\n"
+            "📱 Вставь его в приложение Happ.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    bot.answer_callback_query(call.id, "✅ Подписка активирована")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "my_subs")
+def cb_my_subs(call):
+    update_expired_subscriptions()
+    subs = get_user_subscriptions(call.from_user.id)
+
+    if not subs:
+        text = (
+            "📦 <b>Мои подписки</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "У вас пока нет купленных подписок.\n\n"
+            "👇 Нажмите «⚡ Купить подписку», чтобы оформить."
+        )
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton("⚡ Купить подписку", callback_data="buy"))
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+        try:
+            bot.edit_message_text(text, chat_id=call.message.chat.id,
+                                  message_id=call.message.message_id,
+                                  reply_markup=kb, parse_mode="HTML")
+        except:
+            pass
+        return
+
+    text = "📦 <b>Мои подписки</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for s in subs[:10]:
+        sid, tariff_name, days, price, vpn_key, activated_at, expires_at, status = s
+        try:
+            exp_str = datetime.datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
+        except:
+            exp_str = expires_at[:10]
+        try:
+            act_str = datetime.datetime.fromisoformat(activated_at).strftime("%d.%m.%Y")
+        except:
+            act_str = activated_at[:10]
+
+        icon = "🟢" if status == "Активна" else "🔴"
+        vpn_display = vpn_key if vpn_key else "—"
+        text += (
+            f"{icon} <b>{tariff_name}</b>\n"
+            f"   🆔 Заказ: <code>#{sid}</code>\n"
+            f"   📅 Куплено: {act_str}\n"
+            f"   ⏰ Действует до: {exp_str}\n"
+            f"   💰 Цена: {price}₽\n"
+            f"   📊 Статус: {status}\n"
+            f"   🔑 Ключ VPN:\n"
+            f"   <code>{vpn_display}</code>\n"
+            f"   ───────────────\n"
+        )
+
+    if len(subs) > 10:
+        text += f"\n<i>Показано 10 из {len(subs)}</i>"
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("⚡ Купить ещё", callback_data="buy"))
+    kb.add(types.InlineKeyboardButton("🌐 Открыть сайт", url=SITE_URL))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=kb, parse_mode="HTML")
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "bonus")
+def cb_bonus(call):
+    try:
+        bot.edit_message_text(
+            "🎁 <b>Бонусная программа.</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n👇 <b>Выберите раздел:</b>",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=bonus_kb(), parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "promo")
+def cb_promo(call):
+    try:
+        bot.edit_message_text(
+            "🎟 <b>Ввод промокода</b>\n\nНапиши промокод в чат:",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=back_kb(), parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "invite")
+def cb_invite(call):
+    bot_username = bot.get_me().username
+    link = f"https://t.me/{bot_username}?start={call.from_user.id}"
+    try:
+        bot.edit_message_text(
+            f"👥 <b>Пригласи друга</b>\n\nТвоя ссылка:\n<code>{link}</code>\n\nЗа каждого приглашённого — бонус!",
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            reply_markup=back_kb(), parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "info")
+def cb_info(call):
+    text = (
+        "ℹ️ <b>Информация</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚀 <b>VIBE VPN</b> — быстрый и стабильный VPN.\n\n"
+        "📌 <b>Преимущества:</b>\n• Безлимитный трафик\n• Несколько локаций\n• Стабильная работа\n• Поддержка 24/7\n\n"
+        "📄 <b>Документы:</b>\n"
+        f"• <a href='{PRIVACY_URL}'>Политика конфиденциальности</a>\n"
+        f"• <a href='{TERMS_URL}'>Пользовательское соглашение</a>\n\n"
+        f"👨‍💻 Разработчик: {DEV}\n💬 Поддержка: {SUPPORT}\n━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=back_kb(), parse_mode="HTML",
+                              disable_web_page_preview=True)
+    except:
+        pass
+
+
+# ============================================================
+#             ПОПОЛНЕНИЕ БАЛАНСА
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "topup")
+def cb_topup(call):
+    user = get_user(call.from_user.id)
+    balance = user[4] if user else 0
+    text = (
+        "💳 <b>Пополнение баланса</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Ваш баланс: <b>{balance}₽</b>\n\n"
+        f"Напишите в чат сумму пополнения\n"
+        f"в рублях (от <b>{MIN_TOPUP}</b> до <b>{MAX_TOPUP}</b>)."
+    )
+    user_states[call.from_user.id] = "waiting_topup_amount"
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=back_kb(), parse_mode="HTML")
+    except:
+        pass
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("paid_"))
+def cb_paid(call):
+    pid = int(call.data.replace("paid_", ""))
+    payment = get_payment(pid)
+    if not payment:
+        return bot.answer_callback_query(call.id, "❌ Заявка не найдена", show_alert=True)
+    _, tg_id, amount, status, created_at = payment
+    if status != "pending":
+        return bot.answer_callback_query(call.id, "⚠️ Заявка уже обработана", show_alert=True)
+
+    created = datetime.datetime.fromisoformat(created_at)
+    elapsed = (datetime.datetime.now() - created).total_seconds() / 60
+    if elapsed > PAYMENT_TIMEOUT_MIN:
+        set_payment_status(pid, "expired")
+        return bot.answer_callback_query(call.id, "⏰ Время оплаты истекло", show_alert=True)
+
+    user = get_user(tg_id)
+    username = f"@{user[1]}" if user and user[1] else "без username"
+    name = user[2] if user and user[2] else "—"
+
+    admin_text = (
+        "🔔 <b>НОВАЯ ЗАЯВКА НА ПОПОЛНЕНИЕ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Заявка: <code>#{pid}</code>\n"
+        f"👤 Пользователь: {name} ({username})\n"
+        f"🆔 ID: <code>{tg_id}</code>\n"
+        f"💰 Сумма: <b>{amount}₽</b>\n"
+        f"🕐 Создана: {created_at[:19]}\n\n"
+        f"✅ Подтвердить: <code>/pay {pid}</code>\n"
+        f"❌ Отклонить: <code>/reject {pid}</code>"
+    )
+    try:
+        bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        print(f"Admin notify error: {e}")
+
+    try:
+        bot.edit_message_text(
+            "✅ <b>Заявка отправлена!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Сумма: <b>{amount}₽</b>\n"
+            f"🆔 Заявка: <code>#{pid}</code>\n\n"
+            "⏳ Ожидайте подтверждения администратора.\n"
+            "Обычно занимает 5–15 минут.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    bot.answer_callback_query(call.id, "✅ Заявка отправлена")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cancel_"))
+def cb_cancel(call):
+    pid = int(call.data.replace("cancel_", ""))
+    payment = get_payment(pid)
+    if payment and payment[3] == "pending":
+        set_payment_status(pid, "cancelled")
+    user_states.pop(call.from_user.id, None)
+    user = get_user(call.from_user.id)
+    try:
+        bot.edit_message_text(
+            main_menu_text(user),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=main_kb(),
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    bot.answer_callback_query(call.id, "Заявка отменена")
+
+
+# ============================================================
+#                    СТАТУС / ПРОБНАЯ
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "servers")
+def cb_servers(call):
+    text = (
+        "📊 <b>Статус серверов</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🇳🇱 Нидерланды  🟢 24 ms\n"
+        "🇩🇪 Германия    🟢 38 ms\n"
+        "🇫🇮 Финляндия   🟢 42 ms\n"
+        "🇬🇧 Англия      🟢 55 ms\n"
+        "🇺🇸 США         🟢 120 ms\n"
+        "🇯🇵 Япония      🟢 180 ms\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n🟢 — работает стабильно"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=back_kb(), parse_mode="HTML")
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "trial")
+def cb_trial(call):
+    text = (
+        "🎁 <b>Пробная подписка</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ты можешь активировать <b>бесплатный доступ на 5 дней</b>.\n\n"
+        "👇 Нажми кнопку ниже, чтобы активировать."
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=trial_kb(), parse_mode="HTML")
+    except:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "activate_trial")
+def cb_activate_trial(call):
+    user = get_user(call.from_user.id)
+    if user and user[7] == 1:
+        return bot.answer_callback_query(call.id, "❌ Ты уже использовал пробную подписку", show_alert=True)
+    set_trial_used(call.from_user.id)
+    expire = (datetime.datetime.now() + datetime.timedelta(days=5)).isoformat()
+    add_subscription_record(call.from_user.id, "Пробная (5 дней)", 5, 0, None, expire)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=TRIAL_URL))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+
+    text = (
+        "✅ <b>Пробная подписка активирована!</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎁 Тебе доступен <b>бесплатный доступ на 5 дней</b>.\n\n"
+        "👇 Перейди по ссылке, чтобы получить ключ:\n\n"
+        f"🌐 {TRIAL_URL}\n\n"
+        "📱 <b>Как подключиться:</b>\n"
+        "1. Перейди по ссылке\n"
+        "2. Получи свой ключ\n"
+        "3. Открой приложение Happ\n"
+        "4. Вставь ключ и подключись\n\n"
+        "⏰ Доступ на 5 дней.\n━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        bot.edit_message_text(text, chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              reply_markup=kb, parse_mode="HTML")
+    except:
+        pass
+
+
+# ============================================================
+#           ВВОД СУММЫ И ПОКАЗ РЕКВИЗИТОВ
+# ============================================================
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_topup_amount")
+def handle_topup_amount(message):
+    try:
+        amount = int(message.text.strip())
+    except:
+        return bot.reply_to(message, f"❌ Введите число от {MIN_TOPUP} до {MAX_TOPUP}")
+
+    if amount < MIN_TOPUP or amount > MAX_TOPUP:
+        return bot.reply_to(message, f"❌ Сумма должна быть от {MIN_TOPUP}₽ до {MAX_TOPUP}₽")
+
+    user_states.pop(message.from_user.id, None)
+    pid = create_payment(message.from_user.id, amount)
+
+    text = (
+        f"💳 <b>Оплата заявки #{pid}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Сумма: <b>{amount}₽</b>\n\n"
+        f"📱 <b>Переведите сумму на карту:</b>\n"
+        f"<code>{CARD_NUMBER}</code>\n\n"
+        f"⏰ <b>У вас {PAYMENT_TIMEOUT_MIN} минут</b> на оплату.\n"
+        "После этого заявка будет отменена.\n\n"
+        "Когда переведёте — нажмите <b>«✅ Я оплатил»</b>.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    bot.send_message(message.chat.id, text,
+                     reply_markup=payment_kb(pid), parse_mode="HTML")
+
+    threading.Thread(target=payment_timeout, args=(message.from_user.id, pid), daemon=True).start()
+
+
+def payment_timeout(user_id, pid):
+    time.sleep(PAYMENT_TIMEOUT_MIN * 60)
+    payment = get_payment(pid)
+    if not payment:
+        return
+    if payment[3] == "pending":
+        set_payment_status(pid, "expired")
+        try:
+            bot.send_message(
+                user_id,
+                f"⏰ <b>Заявка #{pid} отменена</b>\n\n"
+                f"Прошло {PAYMENT_TIMEOUT_MIN} минут — оплата не поступила.\n"
+                "Создайте новую заявку в меню.",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+
+# ============================================================
+#                    ADMIN КОМАНДЫ
+# ============================================================
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE sub_status LIKE 'Активна%'")
+    active = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM payments WHERE status = 'pending'")
+    pending = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM subscriptions")
+    total_subs = c.fetchone()[0]
+    conn.close()
+    bot.send_message(
+        message.chat.id,
+        f"🔐 <b>Админ-панель VIBE VPN</b>\n\n"
+        f"👥 Всего: <b>{total}</b>\n"
+        f"🟢 Активных: <b>{active}</b>\n"
+        f"⏳ Заявок: <b>{pending}</b>\n"
+        f"📦 Всего подписок: <b>{total_subs}</b>\n\n"
+        f"Команды:\n"
+        f"<code>/pay &lt;id&gt;</code> — подтвердить оплату\n"
+        f"<code>/reject &lt;id&gt;</code> — отклонить\n"
+        f"<code>/addbal &lt;id&gt; &lt;сумма&gt;</code> — вручную\n"
+        f"<code>/broadcast &lt;текст&gt;</code> — рассылка",
+        parse_mode="HTML"
+    )
+
+
+@bot.message_handler(commands=['pay'])
+def admin_pay(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        pid = int(message.text.split()[1])
+    except:
+        return bot.reply_to(message, "Используй: /pay <id_заявки>")
+
+    payment = get_payment(pid)
+    if not payment:
+        return bot.reply_to(message, "❌ Заявка не найдена")
+    _, tg_id, amount, status, _ = payment
+    if status != "pending":
+        return bot.reply_to(message, f"⚠️ Статус: {status}")
+
+    add_balance(tg_id, amount)
+    set_payment_status(pid, "confirmed")
+    bot.reply_to(message, f"✅ Заявка #{pid} подтверждена. +{amount}₽ → {tg_id}")
+
+    try:
+        bot.send_message(
+            tg_id,
+            f"✅ <b>Оплата подтверждена!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Зачислено: <b>+{amount}₽</b>\n"
+            f"🆔 Заявка: <code>#{pid}</code>\n\n"
+            "Спасибо за пополнение!",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.message_handler(commands=['reject'])
+def admin_reject(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        pid = int(message.text.split()[1])
+    except:
+        return bot.reply_to(message, "Используй: /reject <id_заявки>")
+
+    payment = get_payment(pid)
+    if not payment:
+        return bot.reply_to(message, "❌ Заявка не найдена")
+    _, tg_id, amount, status, _ = payment
+    if status != "pending":
+        return bot.reply_to(message, f"⚠️ Статус: {status}")
+
+    set_payment_status(pid, "rejected")
+    bot.reply_to(message, f"❌ Заявка #{pid} отклонена")
+
+    try:
+        bot.send_message(
+            tg_id,
+            f"❌ <b>Оплата не подтверждена</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Заявка: <code>#{pid}</code>\n"
+            f"💰 Сумма: {amount}₽\n\n"
+            "Оплата не поступила на реквизиты.\n"
+            "Проверьте перевод или создайте новую заявку.",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+
+
+@bot.message_handler(commands=['addbal'])
+def admin_addbal(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.split()
+        uid = int(parts[1])
+        amount = int(parts[2])
+        add_balance(uid, amount)
+        bot.reply_to(message, f"✅ Баланс {uid} пополнен на {amount}₽")
+        try:
+            bot.send_message(uid, f"💰 Баланс пополнен на <b>+{amount}₽</b>", parse_mode="HTML")
+        except:
+            pass
+    except:
+        bot.reply_to(message, "Используй: /addbal <id> <сумма>")
+
+
+@bot.message_handler(commands=['broadcast'])
+def admin_broadcast(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.replace("/broadcast", "").strip()
+    if not text:
+        return bot.reply_to(message, "Используй: /broadcast <текст>")
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT tg_id FROM users")
+    users = c.fetchall()
+    conn.close()
+    sent = 0
+    for (uid,) in users:
+        try:
+            bot.send_message(uid, text, parse_mode="HTML")
+            sent += 1
+            time.sleep(0.05)
+        except:
+            pass
+    bot.reply_to(message, f"✅ Отправлено: {sent}")
+
+
+# ============================================================
+#                    RUN
+# ============================================================
+if __name__ == "__main__":
+    init_db()
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    print("🚀 VIBE VPN BOT запущен")
+    print(f"👨‍💻 Разработчик: {DEV}")
+    print(f"👤 Админ ID: {ADMIN_ID}")
+    print(f"💳 Карта: {CARD_NUMBER}")
+    print(f"🔑 Ключ: {MASTER_SUB_URL}")
+    print(f"⏰ Таймаут: {PAYMENT_TIMEOUT_MIN} мин")
+    print(f"💰 Лимит: {MIN_TOPUP}-{MAX_TOPUP}₽")
+    bot.infinity_polling()
